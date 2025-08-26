@@ -63,6 +63,18 @@ const ProjectStats = ({ fileId }) => {
     return colors[extension] || 'default';
   };
 
+  if (!fileId) {
+    return (
+      <div style={{ textAlign: 'center', padding: 60 }}>
+        <BarChartOutlined style={{ fontSize: 64, color: '#d9d9d9', marginBottom: 24 }} />
+        <Title level={3} type="secondary">请选择项目</Title>
+        <Text type="secondary" style={{ display: 'block', marginTop: 16 }}>
+          请从顶部选择器中选择一个项目来查看项目统计信息
+        </Text>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
       <div className="loading-container">

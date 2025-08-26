@@ -83,6 +83,18 @@ const FileSearch = ({ fileId }) => {
     return new Date(dateString).toLocaleString('zh-CN');
   };
 
+  if (!fileId) {
+    return (
+      <div style={{ textAlign: 'center', padding: 60 }}>
+        <SearchOutlined style={{ fontSize: 64, color: '#d9d9d9', marginBottom: 24 }} />
+        <Title level={3} type="secondary">请选择项目</Title>
+        <Text type="secondary" style={{ display: 'block', marginTop: 16 }}>
+          请从顶部选择器中选择一个项目来搜索文件
+        </Text>
+      </div>
+    );
+  }
+
   return (
     <div>
       <Title level={2}>文件搜索</Title>

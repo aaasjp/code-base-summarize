@@ -129,12 +129,17 @@ const FileExplorer = ({ fileId, onShowDocs }) => {
     }
   };
 
-  const handleGenerateDocs = async () => {
+  const handleProjectSummarize = async () => {
     try {
       setGeneratingDocs(true);
-      message.loading('正在生成代码文档，请稍候...', 0);
+      message.loading('正在进行项目技术总结，请稍候...', 0);
       
-      const response = await axios.post(`/api/analysis/generate-docs/${fileId}`, {}, {
+      // 获取项目路径
+      const projectPath = `/Users/ailabuser7-1/Documents/cursor-workspace/code-base-summarize/backend/extracted/${fileId}`;
+      
+      const response = await axios.post('/api/project/summarize', {
+        project_path: projectPath
+      }, {
         headers: {
           'Content-Type': 'application/json'
         }
@@ -142,25 +147,37 @@ const FileExplorer = ({ fileId, onShowDocs }) => {
       
       message.destroy();
       
-      if (response.data.success) {
-        const { success_count, error_count, total_directories } = response.data.data;
-        message.success(`文档生成完成！成功处理 ${success_count} 个目录，失败 ${error_count} 个`);
-        
-        // 通知父组件显示文档
-        if (onShowDocs) {
-          onShowDocs();
+              if (response.data.success) {
+          const { success_count, total_files, summary_docs_dir } = response.data.data;
+          message.success(`项目技术总结完成！成功处理 ${success_count}/${total_files} 个源代码文件，总结文档保存在：${summary_docs_dir}`);
+          
+          // 通知父组件显示文档
+          if (onShowDocs) {
+            onShowDocs();
+          }
+        } else {
+          message.error('项目技术总结失败');
         }
-      } else {
-        message.error('生成文档失败');
-      }
     } catch (error) {
       message.destroy();
-      console.error('生成文档错误:', error);
-      message.error('生成文档失败: ' + (error.response?.data?.error || error.message));
+      console.error('项目技术总结错误:', error);
+      message.error('项目技术总结失败: ' + (error.response?.data?.error || error.message));
     } finally {
       setGeneratingDocs(false);
     }
   };
+
+  if (!fileId) {
+    return (
+      <div style={{ textAlign: 'center', padding: 60 }}>
+        <FileOutlined style={{ fontSize: 64, color: '#d9d9d9', marginBottom: 24 }} />
+        <Title level={3} type="secondary">请选择项目</Title>
+        <Text type="secondary" style={{ display: 'block', marginTop: 16 }}>
+          请从顶部选择器中选择一个项目来浏览文件结构
+        </Text>
+      </div>
+    );
+  }
 
   if (loading) {
     return (
@@ -185,10 +202,10 @@ const FileExplorer = ({ fileId, onShowDocs }) => {
             type="primary" 
             icon={<BookOutlined />}
             loading={generatingDocs}
-            onClick={handleGenerateDocs}
+            onClick={handleProjectSummarize}
             size="large"
           >
-            生成代码文档
+            项目技术总结
           </Button>
         </Col>
       </Row>

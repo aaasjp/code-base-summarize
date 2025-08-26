@@ -18,6 +18,8 @@ from constants import CODE_EXTENSIONS
 from llm.qwen_llm import QwenLLM
 from prompts.business_logic import BUSINESS_SUMMARY_PROMPT
 from prompts.technical_documentation import TECHNICAL_DOCUMENTATION_PROMPT
+from prompts.technical_summary import TECHNICAL_SUMMARY_PROMPT, DOCUMENT_TITLE_PROMPT
+from prompts.file_summary import FILE_SUMMARY_PROMPT, FILE_TITLE_PROMPT
 
 app = Flask(__name__)
 CORS(app)
@@ -346,6 +348,54 @@ def delete_upload(file_id):
         print(f"删除文件失败: {e}")
         return jsonify({'error': '删除文件失败'}), 500
 
+@app.route('/api/projects', methods=['GET'])
+def get_projects():
+    """获取所有已上传的项目列表"""
+    try:
+        projects = []
+        
+        # 从uploads目录获取项目信息
+        uploads_dir = app.config['UPLOAD_FOLDER']
+        if os.path.exists(uploads_dir):
+            for filename in os.listdir(uploads_dir):
+                if filename.endswith('.zip'):
+                    file_id = filename[:-4]  # 移除.zip扩展名
+                    file_path = os.path.join(uploads_dir, filename)
+                    stats = get_file_stats(file_path)
+                    
+                    # 检查是否有对应的解压目录
+                    extracted_path = os.path.join(app.config['EXTRACTED_FOLDER'], file_id)
+                    has_extracted = os.path.exists(extracted_path)
+                    
+                    # 检查是否有生成的文档
+                    docs_path = os.path.join(app.config['DOCS_FOLDER'], file_id)
+                    has_docs = os.path.exists(docs_path)
+                    
+                    projects.append({
+                        'file_id': file_id,
+                        'original_name': filename,
+                        'file_size': stats['size'],
+                        'uploaded_at': stats['created_at'],
+                        'modified_at': stats['modified_at'],
+                        'has_extracted': has_extracted,
+                        'has_docs': has_docs
+                    })
+        
+        # 按上传时间倒序排序
+        projects.sort(key=lambda x: x['uploaded_at'], reverse=True)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'projects': projects,
+                'total_projects': len(projects)
+            }
+        })
+        
+    except Exception as e:
+        print(f"获取项目列表失败: {e}")
+        return jsonify({'error': '获取项目列表失败'}), 500
+
 @app.route('/api/analysis/structure/<file_id>', methods=['GET'])
 def get_project_structure(file_id):
     """获取项目结构"""
@@ -599,9 +649,11 @@ def get_project_stats(file_id):
         print(f"获取项目统计失败: {e}")
         return jsonify({'error': '获取项目统计失败'}), 500
 
-@app.route('/api/analysis/generate-docs/<file_id>', methods=['POST'])
-def generate_documentation(file_id):
-    """生成代码文档接口"""
+
+
+@app.route('/api/project/summarize', methods=['POST'])
+def summarize_project():
+    """项目代码技术总结接口 - 对每个源代码文件分别进行总结"""
     try:
         # 检查Content-Type
         if not request.is_json:
@@ -612,20 +664,17 @@ def generate_documentation(file_id):
         
         # 获取请求参数
         data = request.get_json() or {}
-        start_directory = data.get('start_directory', '')  # 可选的起始目录
+        project_path = data.get('project_path', '')
         
-        # 验证文件ID
-        extracted_path = os.path.join(app.config['EXTRACTED_FOLDER'], file_id)
-        if not os.path.exists(extracted_path):
-            return jsonify({'error': '项目不存在或已被删除'}), 404
+        if not project_path:
+            return jsonify({'error': '项目路径不能为空'}), 400
         
-        # 确定起始目录
-        if start_directory:
-            start_path = os.path.join(extracted_path, start_directory)
-            if not os.path.exists(start_path) or not os.path.isdir(start_path):
-                return jsonify({'error': '指定的起始目录不存在'}), 400
-        else:
-            start_path = extracted_path
+        # 验证项目路径
+        if not os.path.exists(project_path):
+            return jsonify({'error': '项目路径不存在'}), 400
+        
+        if not os.path.isdir(project_path):
+            return jsonify({'error': '项目路径不是目录'}), 400
         
         # 初始化LLM客户端
         try:
@@ -633,83 +682,181 @@ def generate_documentation(file_id):
         except Exception as e:
             return jsonify({'error': f'LLM客户端初始化失败: {str(e)}'}), 500
         
-        # 获取所有子目录（按深度降序排序）
-        subdirectories = get_all_subdirectories(start_path)
+        # 获取所有源代码文件
+        code_files = []
+        for root, dirs, files in os.walk(project_path):
+            for file in files:
+                if is_code_file(os.path.join(root, file)):
+                    file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(file_path, project_path)
+                    code_files.append({
+                        'path': file_path,
+                        'relative_path': relative_path,
+                        'name': file,
+                        'extension': Path(file).suffix.lower()
+                    })
         
-        # 添加起始目录本身
-        all_directories = [start_path] + subdirectories
+        if not code_files:
+            return jsonify({'error': '项目中未找到源代码文件'}), 400
+        
+        # 创建总结文档根目录
+        project_name = os.path.basename(project_path)
+        summary_docs_dir = os.path.join(app.config['DOCS_FOLDER'], project_name)
+        Path(summary_docs_dir).mkdir(parents=True, exist_ok=True)
         
         results = []
-        total_directories = len(all_directories)
+        success_count = 0
+        error_count = 0
         
-        for i, directory_path in enumerate(all_directories):
+        print(f"📝 开始处理 {len(code_files)} 个源代码文件...")
+        
+        # 对每个源代码文件分别进行总结
+        for i, code_file in enumerate(code_files):
             try:
-                directory_name = os.path.basename(directory_path)
-                relative_path = os.path.relpath(directory_path, extracted_path)
+                print(f"📄 正在处理文件 ({i+1}/{len(code_files)}): {code_file['relative_path']}")
                 
-                print(f"📝 正在处理目录 ({i+1}/{total_directories}): {relative_path}")
+                # 读取源代码文件内容
+                try:
+                    with open(code_file['path'], 'r', encoding='utf-8') as f:
+                        source_code = f.read()
+                except UnicodeDecodeError:
+                    # 如果UTF-8解码失败，尝试其他编码
+                    try:
+                        with open(code_file['path'], 'r', encoding='gbk') as f:
+                            source_code = f.read()
+                    except UnicodeDecodeError:
+                        try:
+                            with open(code_file['path'], 'r', encoding='latin-1') as f:
+                                source_code = f.read()
+                        except Exception as e:
+                            raise Exception(f"无法读取文件编码: {e}")
                 
-                # 检查目录是否包含代码文件
-                code_files = []
-                for root, dirs, files in os.walk(directory_path):
-                    for file in files:
-                        if is_code_file(os.path.join(root, file)):
-                            code_files.append(file)
+                # 检查文件内容是否为空
+                if not source_code.strip():
+                    raise Exception("文件内容为空")
                 
-                if not code_files:
-                    print(f"⚠️ 目录 {relative_path} 不包含代码文件，跳过")
-                    continue
+                # 限制文件大小，避免过大的文件导致API调用失败
+                if len(source_code) > 50000:  # 50KB限制
+                    source_code = source_code[:50000] + "\n\n... (文件内容过长，已截断)"
                 
-                # 生成文档
-                docs_data = generate_documentation_for_directory(directory_path, llm_client)
+                # 生成单个文件的总结提示词
+                file_summary_prompt = FILE_SUMMARY_PROMPT.format(
+                    file_name=code_file['name'],
+                    file_path=code_file['relative_path'],
+                    file_extension=code_file['extension'],
+                    source_code=source_code
+                )
                 
-                # 保存文档
-                saved_files = save_documentation(docs_data, app.config['DOCS_FOLDER'], directory_name)
+                # 调用大模型生成文件总结
+                try:
+                    file_summary = llm_client.simple_chat(
+                        file_summary_prompt,
+                        "您是一位杰出的软件工程师和技术文档专家，专门进行代码技术分析和总结。请生成高质量的中文技术文档。"
+                    )
+                    
+                    # 检查响应是否为空
+                    if not file_summary or not file_summary.strip():
+                        raise Exception("LLM返回的总结内容为空")
+                        
+                except Exception as llm_error:
+                    raise Exception(f"LLM调用失败: {str(llm_error)}")
+                
+                # 生成文档标题
+                try:
+                    title_prompt = FILE_TITLE_PROMPT.format(
+                        summary_content=file_summary[:500] + "..."
+                    )
+                    
+                    doc_title = llm_client.simple_chat(
+                        title_prompt,
+                        "您是一位文档命名专家，请生成简洁明了的中文文档标题。"
+                    ).strip()
+                    
+                    # 检查标题是否为空
+                    if not doc_title:
+                        doc_title = f"{code_file['name']}技术总结"
+                        
+                except Exception as title_error:
+                    print(f"⚠️ 生成标题失败，使用默认标题: {title_error}")
+                    doc_title = f"{code_file['name']}技术总结"
+                
+                # 清理标题
+                doc_title = doc_title.replace('#', '').replace('*', '').replace('`', '').strip()
+                if not doc_title:
+                    doc_title = f"{code_file['name']}技术总结"
+                
+                # 确保标题是有效的文件名
+                import re
+                doc_title = re.sub(r'[<>:"/\\|?*]', '_', doc_title)
+                
+                # 创建对应的目录结构
+                relative_dir = os.path.dirname(code_file['relative_path'])
+                if relative_dir:
+                    target_dir = os.path.join(summary_docs_dir, relative_dir)
+                    Path(target_dir).mkdir(parents=True, exist_ok=True)
+                else:
+                    target_dir = summary_docs_dir
+                
+                # 保存总结文档
+                doc_filename = f"{doc_title}.md"
+                doc_path = os.path.join(target_dir, doc_filename)
+                
+                with open(doc_path, 'w', encoding='utf-8') as f:
+                    f.write(file_summary)
+                
+                # 获取文档统计信息
+                doc_stats = get_file_stats(doc_path)
                 
                 results.append({
-                    'directory_name': directory_name,
-                    'relative_path': relative_path,
-                    'code_files_count': len(code_files),
-                    'files': saved_files,
+                    'file_name': code_file['name'],
+                    'file_path': code_file['relative_path'],
+                    'doc_title': doc_title,
+                    'doc_filename': doc_filename,
+                    'doc_path': doc_path,
+                    'file_size': doc_stats['size'],
                     'status': 'success'
                 })
                 
-                print(f"✅ 目录 {relative_path} 文档生成完成")
+                success_count += 1
+                print(f"✅ 文件 {code_file['relative_path']} 总结完成")
                 
             except Exception as e:
-                print(f"❌ 处理目录 {directory_path} 失败: {e}")
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"❌ 处理文件 {code_file['relative_path']} 失败: {e}")
+                print(f"错误详情: {error_details}")
                 results.append({
-                    'directory_name': os.path.basename(directory_path),
-                    'relative_path': os.path.relpath(directory_path, extracted_path),
+                    'file_name': code_file['name'],
+                    'file_path': code_file['relative_path'],
                     'error': str(e),
+                    'error_details': error_details,
                     'status': 'error'
                 })
+                error_count += 1
         
-        # 统计结果
-        success_count = len([r for r in results if r['status'] == 'success'])
-        error_count = len([r for r in results if r['status'] == 'error'])
+        print(f"🎉 总结完成！成功处理 {success_count} 个文件，失败 {error_count} 个")
         
         return jsonify({
             'success': True,
-            'message': f'文档生成完成，成功处理 {success_count} 个目录，失败 {error_count} 个',
+            'message': f'项目技术总结完成，成功处理 {success_count} 个文件，失败 {error_count} 个',
             'data': {
-                'file_id': file_id,
-                'start_directory': start_directory or 'root',
-                'total_directories': total_directories,
+                'project_path': project_path,
+                'project_name': project_name,
+                'summary_docs_dir': summary_docs_dir,
+                'total_files': len(code_files),
                 'success_count': success_count,
                 'error_count': error_count,
-                'results': results,
-                'docs_base_path': app.config['DOCS_FOLDER']
+                'results': results
             }
         })
         
     except Exception as e:
-        print(f"生成文档接口失败: {e}")
-        return jsonify({'error': '生成文档失败', 'message': str(e)}), 500
+        print(f"项目技术总结失败: {e}")
+        return jsonify({'error': '项目技术总结失败', 'message': str(e)}), 500
 
 @app.route('/api/analysis/docs/<file_id>', methods=['GET'])
 def get_generated_docs(file_id):
-    """获取生成的文档列表"""
+    """获取项目技术总结文档列表"""
     try:
         docs_path = app.config['DOCS_FOLDER']
         
@@ -724,25 +871,55 @@ def get_generated_docs(file_id):
             })
         
         docs = []
-        for item in os.listdir(docs_path):
-            item_path = os.path.join(docs_path, item)
-            if os.path.isdir(item_path):
-                doc_files = []
-                for file in os.listdir(item_path):
-                    if file.endswith('.md'):
-                        file_path = os.path.join(item_path, file)
-                        stats = get_file_stats(file_path)
-                        doc_files.append({
-                            'name': file,
-                            'path': file_path,
-                            'size': stats['size'],
-                            'modified_at': stats['modified_at']
-                        })
+        
+        # 查找与file_id匹配的项目文档
+        project_docs_path = os.path.join(docs_path, file_id)
+        if os.path.exists(project_docs_path) and os.path.isdir(project_docs_path):
+            # 递归搜索所有子目录中的.md文件
+            def find_md_files_recursive(directory, base_path=''):
+                files = []
+                try:
+                    for item in os.listdir(directory):
+                        item_path = os.path.join(directory, item)
+                        relative_path = os.path.join(base_path, item)
+                        
+                        if os.path.isdir(item_path):
+                            # 递归搜索子目录
+                            sub_files = find_md_files_recursive(item_path, relative_path)
+                            files.extend(sub_files)
+                        elif item.endswith('.md'):
+                            # 找到.md文件
+                            stats = get_file_stats(item_path)
+                            files.append({
+                                'name': item,
+                                'path': item_path,
+                                'relative_path': relative_path,
+                                'size': stats['size'],
+                                'modified_at': stats['modified_at']
+                            })
+                except Exception as e:
+                    print(f"搜索目录失败: {directory}, 错误: {e}")
                 
-                if doc_files:
+                return files
+            
+            # 搜索所有.md文件
+            doc_files = find_md_files_recursive(project_docs_path)
+            
+            if doc_files:
+                # 按目录分组
+                docs_by_directory = {}
+                for file_info in doc_files:
+                    dir_path = os.path.dirname(file_info['relative_path'])
+                    if dir_path not in docs_by_directory:
+                        docs_by_directory[dir_path] = []
+                    docs_by_directory[dir_path].append(file_info)
+                
+                # 转换为API响应格式
+                for dir_path, files in docs_by_directory.items():
                     docs.append({
-                        'directory_name': item,
-                        'files': doc_files
+                        'directory_name': dir_path if dir_path else file_id,
+                        'directory_path': dir_path,
+                        'files': files
                     })
         
         return jsonify({
@@ -755,32 +932,57 @@ def get_generated_docs(file_id):
         })
         
     except Exception as e:
-        print(f"获取文档列表失败: {e}")
-        return jsonify({'error': '获取文档列表失败'}), 500
+        print(f"获取项目技术总结文档列表失败: {e}")
+        return jsonify({'error': '获取项目技术总结文档列表失败'}), 500
 
-@app.route('/api/analysis/docs/<file_id>/<directory_name>/<filename>', methods=['GET'])
-def download_doc(file_id, directory_name, filename):
-    """下载生成的文档"""
+@app.route('/api/analysis/docs/<file_id>/<path:file_path>', methods=['GET'])
+def download_doc(file_id, file_path):
+    """获取或下载项目技术总结文档"""
     try:
-        doc_path = os.path.join(app.config['DOCS_FOLDER'], directory_name, filename)
+        # 构建完整的文档路径
+        doc_path = os.path.join(app.config['DOCS_FOLDER'], file_id, file_path)
         
         if not os.path.exists(doc_path):
-            return jsonify({'error': '文档不存在'}), 404
+            return jsonify({'error': '项目技术总结文档不存在'}), 404
         
         # 安全检查：确保文件路径在docs目录内
         if not os.path.abspath(doc_path).startswith(os.path.abspath(app.config['DOCS_FOLDER'])):
             return jsonify({'error': '访问被拒绝'}), 403
         
-        return send_from_directory(
-            os.path.dirname(doc_path),
-            os.path.basename(doc_path),
-            as_attachment=True,
-            download_name=filename
-        )
+        # 检查是否为文件
+        if not os.path.isfile(doc_path):
+            return jsonify({'error': '路径不是文件'}), 400
+        
+        # 检查请求头，判断是下载还是读取内容
+        accept_header = request.headers.get('Accept', '')
+        response_type = request.args.get('type', 'content')  # 默认为读取内容
+        
+        if response_type == 'download' or 'application/octet-stream' in accept_header:
+            # 下载文件
+            return send_from_directory(
+                os.path.dirname(doc_path),
+                os.path.basename(doc_path),
+                as_attachment=True,
+                download_name=os.path.basename(doc_path)
+            )
+        else:
+            # 读取文件内容
+            try:
+                with open(doc_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+            except UnicodeDecodeError:
+                # 如果UTF-8解码失败，尝试其他编码
+                try:
+                    with open(doc_path, 'r', encoding='gbk') as f:
+                        content = f.read()
+                    return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+                except UnicodeDecodeError:
+                    return jsonify({'error': '文件编码不支持'}), 400
         
     except Exception as e:
-        print(f"下载文档失败: {e}")
-        return jsonify({'error': '下载文档失败'}), 500
+        print(f"获取项目技术总结文档失败: {e}")
+        return jsonify({'error': '获取项目技术总结文档失败'}), 500
 
 @app.errorhandler(413)
 def too_large(e):
